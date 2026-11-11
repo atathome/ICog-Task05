@@ -224,19 +224,26 @@ class MoGVI:
             parts.append(eps * sigma_np[k] + mu_np[k])
         return np.clip(np.concatenate(parts, axis=0), -BOX, BOX)
 
-@TinyJit
 def train_mog(readings_tg, n_steps=3000, lr=3e-3, S=64):
     """Train a MoG variational distribution by maximising the ELBO."""
     mog = MoGVI(K=8)
     opt = nn_tg.optim.Adam(mog.parameters(), lr=lr)
     hist = []
+
+    @Context(TRAINING=1)
+    @TinyJit
+    def train_step():
+        opt.zero_grad()
+        elbo = mog.elbo(readings_tg, S=S)
+        (-elbo).backward()
+        opt.step()
+
+        return elbo
+    
     with Context(TRAINING=1):
         for step in range(n_steps):
-            opt.zero_grad()
-            elbo = mog.elbo(readings_tg, S=S)
-            (-elbo).backward()
-            opt.step()
-            if step % 300 == 0:
+            elbo = train_step()
+            if step % 700 == 0:
                 v = float(elbo.numpy())
                 hist.append((step, v))
                 print(f"  [MoG] step {step:4d}  ELBO = {v:+.3f}")
@@ -289,7 +296,6 @@ class Discriminator:
     def parameters(self):
         return self.net.parameters()
 
-@TinyJit
 def train_avb(readings_tg, n_steps=50, lr=1e-3, batch=256, n_disc=5):
     """
     Adversarial Variational Bayes training loop.
@@ -311,6 +317,30 @@ def train_avb(readings_tg, n_steps=50, lr=1e-3, batch=256, n_disc=5):
     gen_hist  = []   # (step, ELBO estimate)
     disc_hist = []   # (step, discriminator BCE loss)
 
+    @TinyJit
+    def disc_step():
+        opt_d.zero_grad()
+        for _ in range(n_disc):
+            x_q = gen.sample(batch).detach()
+            x_p = Tensor.rand(batch, 2) * (2*BOX) - BOX
+            t_q = disc(x_q)
+            t_p = disc(x_p)
+            d_loss = -(t_q.logsigmoid().mean() + (-t_p).logsigmoid().mean())
+            d_loss.backward()
+            opt_d.step()
+        return d_loss
+
+    @TinyJit
+    def gen_step():
+        opt_g.zero_grad()
+        x_q = gen.sample(batch)
+        ll = log_lik_tg(x_q, readings_tg)
+        t_q = disc(x_q)
+        g_loss = -(ll - t_q).mean()
+        g_loss.backward()
+        opt_g.step()
+        return g_loss
+
     with Context(TRAINING=1):
         for step in range(n_steps):
 
@@ -318,36 +348,12 @@ def train_avb(readings_tg, n_steps=50, lr=1e-3, batch=256, n_disc=5):
             # detach generator output: gradients stay in disc parameters only.
             d_loss_val = None
             for _ in range(n_disc):
-                opt_d.zero_grad()
-
-                x_q = gen.sample(batch).detach()           # q-samples (stop gen grad)
-                x_p = Tensor.rand(batch, 2) * (2*BOX) - BOX  # prior samples
-
-                t_q = disc(x_q)   # logit for q-samples  (want > 0)
-                t_p = disc(x_p)   # logit for prior-samples (want < 0)
-
-                # BCE: maximise log σ(T(x_q)) + log σ(-T(x_p))
-                # Equivalently minimise negative:
-                d_loss = -(t_q.logsigmoid().mean() + (-t_p).logsigmoid().mean())
-                d_loss.backward()
-                opt_d.step()
+                d_loss = disc_step()
                 d_loss_val = float(d_loss.numpy())
 
-            # ── Generator update ──────────────────────────────────────────
-            # Maximise ELBO ≈ E_z[ log L(r|G(z)) - T_ψ(G(z)) ]
-            # T_ψ(x) ≈ log q(x)/p(x), so -T_ψ(x) ≈ log p(x)/q(x) ≈ H_contribution
-            opt_g.zero_grad()
+            g_loss = gen_step()
 
-            x_q  = gen.sample(batch)                 # (batch, 2) — with gen grad
-            ll   = log_lik_tg(x_q, readings_tg)      # (batch,)   — log L(r|x)
-            t_q  = disc(x_q)                          # (batch,)   — loĝ q/p
-
-            # ELBO ≈ E[log L(r|x)] - E[log q(x)/p(x)]
-            g_loss = -(ll - t_q).mean()               # negate → minimise
-            g_loss.backward()
-            opt_g.step()
-
-            if step % 10 == 0:
+            if step % 100 == 0:
                 g_val = float(-g_loss.numpy())
                 gen_hist.append((step, g_val))
                 disc_hist.append((step, d_loss_val))
@@ -382,7 +388,7 @@ if __name__ == "__main__":
 
     # ── Explicit VI: MoG ─────────────────────────────────────────────────
     print("\n=== Explicit VI (Mixture of Gaussians) ===")
-    mog, mog_hist = train_mog(readings_tg, n_steps=900, lr=3e-3, S=64)
+    mog, mog_hist = train_mog(readings_tg, n_steps=22000, lr=3e-3, S=64)
     mog_samples   = mog.get_samples(5000)
     m_mog         = masses(mog_samples, centers)
     print(f"\nMoG-VI TV vs exact = {tv(m_mog, exact):.3f}")
@@ -400,7 +406,7 @@ if __name__ == "__main__":
     # ── Implicit VI: AVB ─────────────────────────────────────────────────
     print("\n=== Implicit VI (Adversarial Variational Bayes) ===")
     gen, disc, gen_hist, disc_hist = train_avb(
-        readings_tg, n_steps=200, lr=1e-3, batch=256, n_disc=5
+        readings_tg, n_steps=3000, lr=1e-3, batch=256, n_disc=5
     )
     avb_samples = gen.sample(5000).numpy()
     m_avb       = masses(avb_samples, centers)
